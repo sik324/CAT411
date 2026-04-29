@@ -1,368 +1,589 @@
-import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Bridge Damage ML Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Bridge Damage Dashboard",
+    page_icon="🌉",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-DEFAULT_OUTPUT_DIR = Path("output/ml_dashboard")
+# ============================================================
+# PATHS
+# ============================================================
+DATA_DIR = Path("data")
+BRIDGES_CSV = DATA_DIR / "ml_bridges.csv"
+FEATURE_CSV = DATA_DIR / "ml_feature_importance.csv"
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+DS_ORDER = ["none", "slight", "moderate", "extensive", "complete"]
+DS_INDEX = {ds: i for i, ds in enumerate(DS_ORDER)}
 COLOR_MAP = {
-    'none': '#2E8B57',
-    'slight': '#1E90FF',
-    'moderate': '#FFA500',
-    'extensive': '#FF4500',
-    'complete': '#8B0000'
+    "none": "#4CAF50",
+    "slight": "#2196F3",
+    "moderate": "#FF9800",
+    "extensive": "#F44336",
+    "complete": "#7B0000",
 }
-DS_ORDER = ['none', 'slight', 'moderate', 'extensive', 'complete']
-REPAIR_ORDER = ['Safe', 'Needs Repair', 'Needs Closure', 'Needs Replacement']
-MODEL_TO_COLS = {
-    'Observed': {
-        'ds': 'Observed_DS',
-        'dr': 'Obs_DR',
-        'repair_cat': 'Obs_Repair_Category',
-        'repair_action': 'Obs_Repair_Action',
-        'priority': 'Obs_Priority',
-        'color': 'Obs_Color',
-        'correct': None,
-        'prob_cols': []
-    },
-    'Random Forest': {
-        'ds': 'RF_DS',
-        'dr': 'RF_DR',
-        'repair_cat': 'RF_Repair_Category',
-        'repair_action': 'RF_Repair_Action',
-        'priority': 'RF_Priority',
-        'color': 'RF_Color',
-        'correct': 'RF_Correct',
-        'prob_cols': ['RF_P_None', 'RF_P_Slight', 'RF_P_Moderate', 'RF_P_Extensive', 'RF_P_Complete']
-    },
-    'Deep Learning': {
-        'ds': 'MLP_DS',
-        'dr': 'MLP_DR',
-        'repair_cat': 'MLP_Repair_Category',
-        'repair_action': 'MLP_Repair_Action',
-        'priority': 'MLP_Priority',
-        'color': 'MLP_Color',
-        'correct': 'MLP_Correct',
-        'prob_cols': ['MLP_P_None', 'MLP_P_Slight', 'MLP_P_Moderate', 'MLP_P_Extensive', 'MLP_P_Complete']
-    }
+DAMAGE_RATIO = {
+    "none": 0.00,
+    "slight": 0.03,
+    "moderate": 0.08,
+    "extensive": 0.25,
+    "complete": 1.00,
+}
+REPAIR_CATEGORY = {
+    "none": "Safe",
+    "slight": "Needs Repair",
+    "moderate": "Needs Repair",
+    "extensive": "Needs Closure",
+    "complete": "Needs Replacement",
+}
+REPAIR_ACTION = {
+    "none": "No action needed",
+    "slight": "Schedule inspection",
+    "moderate": "Plan repair",
+    "extensive": "Close bridge and repair",
+    "complete": "Close bridge and replace",
+}
+REPAIR_PRIORITY = {
+    "none": 0,
+    "slight": 1,
+    "moderate": 2,
+    "extensive": 3,
+    "complete": 4,
 }
 
 
-def find_csv(path_text: str, filename: str) -> Path:
-    base = Path(path_text).expanduser()
-    path = base / filename
-    return path
+# ============================================================
+# HELPERS
+# ============================================================
+def find_col(df: pd.DataFrame, candidates: list[str], required: bool = True):
+    existing = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in existing:
+            return existing[cand.lower()]
+    if required:
+        raise KeyError(f"Could not find required column. Tried: {candidates}")
+    return None
 
 
-@st.cache_data(show_spinner=False)
-def load_data(base_dir: str):
-    base = Path(base_dir).expanduser()
-    bridges = pd.read_csv(base / 'ml_bridges.csv')
-    summary = pd.read_csv(base / 'ml_summary.csv')
-    feat = pd.read_csv(base / 'ml_feature_importance.csv')
-    long_df = None
-    repair = None
-    long_path = base / 'ml_long.csv'
-    repair_path = base / 'ml_repair_priority.csv'
-    if long_path.exists():
-        long_df = pd.read_csv(long_path)
-    if repair_path.exists():
-        repair = pd.read_csv(repair_path)
+@st.cache_data
+def load_data():
+    bridges = pd.read_csv(BRIDGES_CSV)
 
-    # normalize types
-    num_cols = ['Latitude', 'Longitude', 'Sa_1s_g', 'PGA_g', 'Obs_DR', 'RF_DR', 'MLP_DR']
-    for c in num_cols:
-        if c in bridges.columns:
-            bridges[c] = pd.to_numeric(bridges[c], errors='coerce')
+    feat = pd.DataFrame()
+    if FEATURE_CSV.exists():
+        feat = pd.read_csv(FEATURE_CSV)
 
-    # Create helper columns for modeling comparisons
-    bridges['Observed_Damaged'] = bridges['Observed_DS'] != 'none'
-    bridges['RF_Damaged'] = bridges['RF_DS'] != 'none'
-    bridges['MLP_Damaged'] = bridges['MLP_DS'] != 'none'
-    return bridges, summary, feat, long_df, repair
+    return bridges, feat
 
 
-def metric_card(col, label, value, delta=None):
-    with col:
-        st.metric(label, value, delta)
-
-
-def filtered_df(df, model_name, filters):
-    cols = MODEL_TO_COLS[model_name]
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    eras = filters.get('eras')
-    if eras:
-        out = out[out['Design_Era'].isin(eras)]
+    colmap = {
+        "structure_id": find_col(out, ["Structure_ID", "structure_id", "structure_number", "Structure_Number"]),
+        "lat": find_col(out, ["Latitude", "latitude", "lat"]),
+        "lon": find_col(out, ["Longitude", "longitude", "lon"]),
+        "hwb": find_col(out, ["HWB_Class", "hwb_class", "HWB"]),
+        "year_built": find_col(out, ["Year_Built", "year_built"]),
+        "design_era": find_col(out, ["Design_Era", "design_era"]),
+        "num_spans": find_col(out, ["Num_Spans", "num_spans"], required=False),
+        "sa": find_col(out, ["Sa_1s_g", "sa1s_shakemap", "sa_1s_g"]),
+        "pga": find_col(out, ["PGA_g", "pga_shakemap", "pga_g"], required=False),
+        "obs": find_col(out, ["Observed_DS", "obs", "Observed_damage"]),
+        "rf": find_col(out, ["RF_DS", "pred_rf", "rf_ds"], required=False),
+        "gmm_map": find_col(out, ["GMM_DS", "pred_gmm_map", "gmm_map", "pred_gmm"], required=False),
+        "gmm_cost": find_col(out, ["pred_gmm_cost", "gmm_cost"], required=False),
+    }
 
-    hwb = filters.get('hwb')
-    if hwb:
-        out = out[out['HWB_Class'].isin(hwb)]
+    rename_dict = {
+        colmap["structure_id"]: "Structure_ID",
+        colmap["lat"]: "Latitude",
+        colmap["lon"]: "Longitude",
+        colmap["hwb"]: "HWB_Class",
+        colmap["year_built"]: "Year_Built",
+        colmap["design_era"]: "Design_Era",
+        colmap["sa"]: "Sa_1s_g",
+        colmap["obs"]: "Observed_DS",
+    }
+    if colmap["num_spans"]:
+        rename_dict[colmap["num_spans"]] = "Num_Spans"
+    if colmap["pga"]:
+        rename_dict[colmap["pga"]] = "PGA_g"
+    if colmap["rf"]:
+        rename_dict[colmap["rf"]] = "RF_DS"
+    if colmap["gmm_map"]:
+        rename_dict[colmap["gmm_map"]] = "GMM_MAP_DS"
+    if colmap["gmm_cost"]:
+        rename_dict[colmap["gmm_cost"]] = "GMM_COST_DS"
 
-    years = filters.get('years')
-    if years:
-        out = out[(out['Year_Built'] >= years[0]) & (out['Year_Built'] <= years[1])]
+    out = out.rename(columns=rename_dict)
 
-    sa_rng = filters.get('sa_rng')
-    if sa_rng:
-        out = out[(out['Sa_1s_g'] >= sa_rng[0]) & (out['Sa_1s_g'] <= sa_rng[1])]
+    # Normalize strings
+    for c in ["Observed_DS", "RF_DS", "GMM_MAP_DS", "GMM_COST_DS", "Design_Era", "HWB_Class"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str).str.strip().str.lower()
 
-    obs_states = filters.get('obs_states')
-    if obs_states:
-        out = out[out['Observed_DS'].isin(obs_states)]
+    # Derived fields
+    out["Obs_DR"] = out["Observed_DS"].map(DAMAGE_RATIO)
+    out["Obs_Repair_Category"] = out["Observed_DS"].map(REPAIR_CATEGORY)
+    out["Obs_Repair_Action"] = out["Observed_DS"].map(REPAIR_ACTION)
+    out["Obs_Priority"] = out["Observed_DS"].map(REPAIR_PRIORITY)
 
-    pred_states = filters.get('pred_states')
-    if pred_states and cols['ds'] in out.columns:
-        out = out[out[cols['ds']].isin(pred_states)]
+    if "RF_DS" in out.columns:
+        out["RF_DR"] = out["RF_DS"].map(DAMAGE_RATIO)
+        out["RF_Repair_Category"] = out["RF_DS"].map(REPAIR_CATEGORY)
+        out["RF_Repair_Action"] = out["RF_DS"].map(REPAIR_ACTION)
+        out["RF_Priority"] = out["RF_DS"].map(REPAIR_PRIORITY)
 
-    only_mis = filters.get('only_misclassified', False)
-    if only_mis and cols['correct']:
-        out = out[out[cols['correct']] == 0]
+    if "GMM_MAP_DS" in out.columns:
+        out["GMM_MAP_DR"] = out["GMM_MAP_DS"].map(DAMAGE_RATIO)
+        out["GMM_MAP_Repair_Category"] = out["GMM_MAP_DS"].map(REPAIR_CATEGORY)
+        out["GMM_MAP_Repair_Action"] = out["GMM_MAP_DS"].map(REPAIR_ACTION)
+        out["GMM_MAP_Priority"] = out["GMM_MAP_DS"].map(REPAIR_PRIORITY)
+
+    if "GMM_COST_DS" in out.columns:
+        out["GMM_COST_DR"] = out["GMM_COST_DS"].map(DAMAGE_RATIO)
+        out["GMM_COST_Repair_Category"] = out["GMM_COST_DS"].map(REPAIR_CATEGORY)
+        out["GMM_COST_Repair_Action"] = out["GMM_COST_DS"].map(REPAIR_ACTION)
+        out["GMM_COST_Priority"] = out["GMM_COST_DS"].map(REPAIR_PRIORITY)
 
     return out
 
 
-# ------------------------------------------------------------
-# Sidebar
-# ------------------------------------------------------------
-st.title("Bridge Damage ML Dashboard")
-st.caption("Observed vs Random Forest vs Deep Learning (MLP) for Northridge bridge damage")
+def severity(series: pd.Series) -> pd.Series:
+    return series.map(DS_INDEX).fillna(-1)
 
-with st.sidebar:
-    st.header("Data Source")
-    base_dir = st.text_input(
-        "Folder containing exported CSV files",
-        value=str(DEFAULT_OUTPUT_DIR),
-        help="This folder should contain ml_bridges.csv, ml_summary.csv, and ml_feature_importance.csv"
+
+def metrics_from_prediction(df: pd.DataFrame, pred_col: str) -> dict:
+    obs = df["Observed_DS"]
+    pred = df[pred_col]
+
+    overall = (obs == pred).mean() * 100
+    damaged_mask = obs != "none"
+    damaged_acc = (obs[damaged_mask] == pred[damaged_mask]).mean() * 100 if damaged_mask.any() else np.nan
+    missed = ((obs != "none") & (pred == "none")).sum()
+    false_alarms = ((obs == "none") & (pred != "none")).sum()
+
+    return {
+        "overall_accuracy": overall,
+        "damaged_accuracy": damaged_acc,
+        "missed_damaged": int(missed),
+        "false_alarms": int(false_alarms),
+    }
+
+
+def damage_count_chart(df: pd.DataFrame) -> go.Figure:
+    traces = [("Observed", "Observed_DS", "#4CAF50")]
+    if "RF_DS" in df.columns:
+        traces.append(("Random Forest", "RF_DS", "#2196F3"))
+    if "GMM_MAP_DS" in df.columns:
+        traces.append(("GMM MAP", "GMM_MAP_DS", "#FF9800"))
+    if "GMM_COST_DS" in df.columns:
+        traces.append(("GMM Cost", "GMM_COST_DS", "#9C27B0"))
+
+    fig = go.Figure()
+    x = [ds.capitalize() for ds in DS_ORDER]
+
+    for label, col, color in traces:
+        y = [(df[col] == ds).sum() for ds in DS_ORDER]
+        fig.add_bar(name=label, x=x, y=y, marker_color=color)
+
+    fig.update_layout(
+        barmode="group",
+        title="Damage State Counts",
+        xaxis_title="Damage State",
+        yaxis_title="Number of Bridges",
+        height=430,
     )
-    reload_btn = st.button("Load / Reload data", use_container_width=True)
+    return fig
 
-if reload_btn:
-    st.cache_data.clear()
 
+def repair_count_chart(df: pd.DataFrame) -> go.Figure:
+    traces = [("Observed", "Obs_Repair_Category", "#4CAF50")]
+    if "RF_Repair_Category" in df.columns:
+        traces.append(("Random Forest", "RF_Repair_Category", "#2196F3"))
+    if "GMM_MAP_Repair_Category" in df.columns:
+        traces.append(("GMM MAP", "GMM_MAP_Repair_Category", "#FF9800"))
+    if "GMM_COST_Repair_Category" in df.columns:
+        traces.append(("GMM Cost", "GMM_COST_Repair_Category", "#9C27B0"))
+
+    fig = go.Figure()
+    for label, col, color in traces:
+        y = [(df[col] == c.lower()).sum() if df[col].dtype == object else (df[col] == c).sum() for c in REPAIR_CATEGORY.values()]
+    # safer explicit categories
+    cats = ["Safe", "Needs Repair", "Needs Closure", "Needs Replacement"]
+    for label, col, color in traces:
+        y = [(df[col].astype(str).str.lower() == c.lower()).sum() for c in cats]
+        fig.add_bar(name=label, x=cats, y=y, marker_color=color)
+
+    fig.update_layout(
+        barmode="group",
+        title="Repair Category Counts",
+        xaxis_title="Repair Category",
+        yaxis_title="Number of Bridges",
+        height=430,
+    )
+    return fig
+
+
+def per_ds_correct_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    x = [ds.capitalize() for ds in DS_ORDER]
+
+    if "RF_DS" in df.columns:
+        rf = [((df["Observed_DS"] == ds) & (df["RF_DS"] == ds)).sum() for ds in DS_ORDER]
+        fig.add_bar(name="RF Correct", x=x, y=rf, marker_color="#2196F3")
+
+    if "GMM_MAP_DS" in df.columns:
+        gmm = [((df["Observed_DS"] == ds) & (df["GMM_MAP_DS"] == ds)).sum() for ds in DS_ORDER]
+        fig.add_bar(name="GMM MAP Correct", x=x, y=gmm, marker_color="#FF9800")
+
+    obs = [(df["Observed_DS"] == ds).sum() for ds in DS_ORDER]
+    fig.add_scatter(name="Observed Total", x=x, y=obs, mode="lines+markers", line=dict(color="green", width=3))
+
+    fig.update_layout(
+        barmode="group",
+        title="Per Damage-State Correct Predictions",
+        xaxis_title="Damage State",
+        yaxis_title="Count",
+        height=430,
+    )
+    return fig
+
+
+def missed_false_alarm_chart(df: pd.DataFrame) -> go.Figure:
+    labels = []
+    missed = []
+    false_alarms = []
+
+    if "RF_DS" in df.columns:
+        m = metrics_from_prediction(df, "RF_DS")
+        labels.append("RF")
+        missed.append(m["missed_damaged"])
+        false_alarms.append(m["false_alarms"])
+
+    if "GMM_MAP_DS" in df.columns:
+        m = metrics_from_prediction(df, "GMM_MAP_DS")
+        labels.append("GMM MAP")
+        missed.append(m["missed_damaged"])
+        false_alarms.append(m["false_alarms"])
+
+    if "GMM_COST_DS" in df.columns:
+        m = metrics_from_prediction(df, "GMM_COST_DS")
+        labels.append("GMM Cost")
+        missed.append(m["missed_damaged"])
+        false_alarms.append(m["false_alarms"])
+
+    fig = go.Figure()
+    fig.add_bar(name="Missed Damaged", x=labels, y=missed, marker_color="#F44336")
+    fig.add_bar(name="False Alarms", x=labels, y=false_alarms, marker_color="#9C27B0")
+
+    fig.update_layout(
+        barmode="group",
+        title="Missed Damaged Bridges vs False Alarms",
+        yaxis_title="Count",
+        height=430,
+    )
+    return fig
+
+
+def make_feature_chart(feat_df: pd.DataFrame) -> go.Figure:
+    feat_cols = {c.lower(): c for c in feat_df.columns}
+    feature_col = feat_cols.get("feature")
+    importance_col = feat_cols.get("importance")
+
+    chart_df = feat_df[[feature_col, importance_col]].rename(
+        columns={feature_col: "Feature", importance_col: "Importance"}
+    ).sort_values("Importance", ascending=True)
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=chart_df["Importance"],
+        y=chart_df["Feature"],
+        orientation="h",
+        marker_color="#2196F3",
+        name="RF Importance",
+    )
+    fig.update_layout(
+        title="Random Forest Feature Importance",
+        xaxis_title="Importance",
+        yaxis_title="Feature",
+        height=430,
+    )
+    return fig
+
+
+def map_figure(df: pd.DataFrame, overlay_model: str) -> go.Figure:
+    fig = go.Figure()
+
+    # Observed damaged bridges: solid markers
+    obs_dmg = df[df["Observed_DS"] != "none"].copy()
+    for ds in [d for d in DS_ORDER if d != "none"]:
+        part = obs_dmg[obs_dmg["Observed_DS"] == ds]
+        if len(part) == 0:
+            continue
+
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=part["Latitude"],
+                lon=part["Longitude"],
+                mode="markers",
+                name=f"Observed {ds}",
+                marker=dict(size=10, color=COLOR_MAP[ds], opacity=0.90),
+                text=part["Structure_ID"].astype(str),
+                hovertemplate=(
+                    "<b>Structure ID:</b> %{text}<br>"
+                    "<b>Observed:</b> " + ds + "<br>"
+                    "<b>Sa(1.0s):</b> %{customdata[0]:.3f}<br>"
+                    "<b>HWB:</b> %{customdata[1]}<extra></extra>"
+                ),
+                customdata=np.stack(
+                    [part["Sa_1s_g"], part["HWB_Class"]],
+                    axis=1
+                ),
+            )
+        )
+
+    def add_overprediction_trace(pred_col: str, label: str, color: str):
+        tmp = df.copy()
+        tmp["obs_idx"] = severity(tmp["Observed_DS"])
+        tmp["pred_idx"] = severity(tmp[pred_col])
+        over = tmp[tmp["pred_idx"] > tmp["obs_idx"]].copy()
+
+        if len(over) == 0:
+            return
+
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=over["Latitude"],
+                lon=over["Longitude"],
+                mode="markers",
+                name=label,
+                marker=dict(
+                    size=16,
+                    color="rgba(0,0,0,0)",
+                    opacity=1.0,
+                    symbol="circle-open",
+                    line=dict(width=2.5, color=color),
+                ),
+                text=over["Structure_ID"].astype(str),
+                hovertemplate=(
+                    "<b>Structure ID:</b> %{text}<br>"
+                    "<b>Observed:</b> %{customdata[0]}<br>"
+                    "<b>Predicted:</b> %{customdata[1]}<br>"
+                    "<b>Sa(1.0s):</b> %{customdata[2]:.3f}<extra></extra>"
+                ),
+                customdata=np.stack(
+                    [over["Observed_DS"], over[pred_col], over["Sa_1s_g"]],
+                    axis=1
+                ),
+            )
+        )
+
+    if overlay_model in ["RF", "Both"] and "RF_DS" in df.columns:
+        add_overprediction_trace("RF_DS", "RF overprediction", "#2196F3")
+
+    if overlay_model in ["GMM MAP", "Both"] and "GMM_MAP_DS" in df.columns:
+        add_overprediction_trace("GMM_MAP_DS", "GMM MAP overprediction", "#FF9800")
+
+    if overlay_model in ["GMM Cost", "Both"] and "GMM_COST_DS" in df.columns:
+        add_overprediction_trace("GMM_COST_DS", "GMM Cost overprediction", "#9C27B0")
+
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        mapbox_zoom=8,
+        mapbox_center={"lat": float(df["Latitude"].mean()), "lon": float(df["Longitude"].mean())},
+        margin={"r": 0, "t": 45, "l": 0, "b": 0},
+        height=700,
+        title="Observed Damaged Bridges (solid) and Model Overpredictions (open circles)",
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
+# ============================================================
+# LOAD
+# ============================================================
 try:
-    bridges, summary, feat, long_df, repair = load_data(base_dir)
+    bridges_raw, feat_df = load_data()
+    df = normalize_columns(bridges_raw)
 except Exception as e:
-    st.error(
-        "Could not load dashboard files. Make sure you exported the ML dashboard CSV files first.\n\n"
-        f"Current folder: {base_dir}\nError: {e}"
-    )
+    st.error("Could not load input files.")
+    st.exception(e)
     st.stop()
 
-# ------------------------------------------------------------
-# Controls
-# ------------------------------------------------------------
-with st.sidebar:
-    st.header("Filters")
-    model_name = st.selectbox("Model view", list(MODEL_TO_COLS.keys()), index=1)
-    eras = st.multiselect("Design era", sorted(bridges['Design_Era'].dropna().unique().tolist()), default=[])
-    hwb = st.multiselect("HWB class", sorted(bridges['HWB_Class'].dropna().unique().tolist()), default=[])
-
-    yr_min = int(np.nanmin(bridges['Year_Built']))
-    yr_max = int(np.nanmax(bridges['Year_Built']))
-    years = st.slider("Year built", min_value=yr_min, max_value=yr_max, value=(yr_min, yr_max))
-
-    sa_min = float(np.nanmin(bridges['Sa_1s_g']))
-    sa_max = float(np.nanmax(bridges['Sa_1s_g']))
-    sa_rng = st.slider("Sa(1.0s) range", min_value=sa_min, max_value=sa_max, value=(sa_min, sa_max))
-
-    obs_states = st.multiselect("Observed damage states", DS_ORDER, default=[])
-    pred_states = st.multiselect(f"{model_name} damage states", DS_ORDER, default=[])
-    only_misclassified = st.checkbox("Only misclassified bridges", value=False, disabled=(model_name == 'Observed'))
-
-filters = {
-    'eras': eras,
-    'hwb': hwb,
-    'years': years,
-    'sa_rng': sa_rng,
-    'obs_states': obs_states,
-    'pred_states': pred_states,
-    'only_misclassified': only_misclassified,
-}
-
-df_view = filtered_df(bridges, model_name, filters)
-cols = MODEL_TO_COLS[model_name]
-
-# ------------------------------------------------------------
-# KPI row
-# ------------------------------------------------------------
-st.subheader(f"Overview — {model_name}")
-
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-metric_card(kpi1, "Bridges in view", f"{len(df_view):,}")
-metric_card(kpi2, "Damaged in view (observed)", f"{(df_view['Observed_DS'] != 'none').sum():,}")
-metric_card(kpi3, f"{model_name} damaged", f"{(df_view[cols['ds']] != 'none').sum():,}")
-metric_card(kpi4, f"Mean {model_name} DR", f"{df_view[cols['dr']].mean():.3f}")
-if cols['correct']:
-    acc = 100 * df_view[cols['correct']].mean() if len(df_view) else 0
-    metric_card(kpi5, f"{model_name} accuracy in view", f"{acc:.1f}%")
-else:
-    metric_card(kpi5, "Observed mean DR", f"{df_view['Obs_DR'].mean():.3f}")
-
-# ------------------------------------------------------------
-# Tabs
-# ------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Summary", "Map", "Bridge Explorer", "Repair Priority", "Model Diagnostics"
-])
-
-with tab1:
-    c1, c2 = st.columns(2)
-
-    with c1:
-        ds_counts = pd.DataFrame({
-            'Damage State': DS_ORDER,
-            'Observed': [(df_view['Observed_DS'] == ds).sum() for ds in DS_ORDER],
-            model_name: [(df_view[cols['ds']] == ds).sum() for ds in DS_ORDER],
-        })
-        fig = go.Figure()
-        fig.add_bar(name='Observed', x=ds_counts['Damage State'], y=ds_counts['Observed'])
-        fig.add_bar(name=model_name, x=ds_counts['Damage State'], y=ds_counts[model_name])
-        fig.update_layout(barmode='group', title='Damage State Distribution', height=420)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
-        rep_counts = pd.DataFrame({
-            'Repair Category': REPAIR_ORDER,
-            'Observed': [(df_view['Obs_Repair_Category'] == c).sum() for c in REPAIR_ORDER],
-            model_name: [(df_view[cols['repair_cat']] == c).sum() for c in REPAIR_ORDER],
-        })
-        fig2 = go.Figure()
-        fig2.add_bar(name='Observed', x=rep_counts['Repair Category'], y=rep_counts['Observed'])
-        fig2.add_bar(name=model_name, x=rep_counts['Repair Category'], y=rep_counts[model_name])
-        fig2.update_layout(barmode='group', title='Repair Category Distribution', height=420)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    c3, c4 = st.columns(2)
-    with c3:
-        fig3 = px.scatter(
-            df_view,
-            x='Sa_1s_g', y=cols['dr'],
-            color=cols['ds'],
-            color_discrete_map=COLOR_MAP,
-            hover_data=['Structure_ID', 'HWB_Class', 'Year_Built', 'Observed_DS', cols['ds']],
-            title=f'{model_name} Damage Ratio vs Sa(1.0s)'
-        )
-        fig3.update_layout(height=420)
-        st.plotly_chart(fig3, use_container_width=True)
-
-    with c4:
-        if cols['correct']:
-            perf = pd.DataFrame({
-                'Metric': ['Accuracy', 'Error Rate'],
-                'Value': [100 * df_view[cols['correct']].mean(), 100 * (1 - df_view[cols['correct']].mean())]
-            })
-            fig4 = px.bar(perf, x='Metric', y='Value', title=f'{model_name} Performance in Current View')
-            fig4.update_layout(height=420, yaxis_title='Percent')
-            st.plotly_chart(fig4, use_container_width=True)
-        else:
-            st.info('Observed view does not have model accuracy metrics.')
-
-with tab2:
-    map_col1, map_col2 = st.columns([3, 1])
-    with map_col1:
-        plot_df = df_view.rename(columns={cols['ds']: 'Display_DS', cols['dr']: 'Display_DR'})
-        figm = px.scatter_map(
-            plot_df,
-            lat='Latitude', lon='Longitude',
-            color='Display_DS',
-            color_discrete_map=COLOR_MAP,
-            hover_name='Structure_ID',
-            hover_data={
-                'HWB_Class': True,
-                'Year_Built': True,
-                'Sa_1s_g': ':.3f',
-                'PGA_g': ':.3f',
-                'Observed_DS': True,
-                'Display_DS': True,
-                'Display_DR': ':.3f',
-            },
-            zoom=7,
-            title=f'{model_name} Spatial Damage View'
-        )
-        figm.update_layout(height=650)
-        st.plotly_chart(figm, use_container_width=True)
-    with map_col2:
-        st.markdown('**Map notes**')
-        st.write(f"Model shown: **{model_name}**")
-        st.write(f"Bridges shown: **{len(df_view):,}**")
-        st.write(f"Mean DR: **{df_view[cols['dr']].mean():.3f}**")
-        if cols['correct']:
-            st.write(f"Accuracy in view: **{100 * df_view[cols['correct']].mean():.1f}%**")
-        st.write("Colors represent predicted or observed damage state.")
-
-with tab3:
-    st.markdown('**Bridge-level table**')
-    display_cols = [
-        'Structure_ID', 'HWB_Class', 'Year_Built', 'Design_Era',
-        'Sa_1s_g', 'PGA_g', 'Observed_DS', cols['ds'], 'Obs_DR', cols['dr'],
-        'Obs_Repair_Category', cols['repair_cat'], cols['repair_action'], cols['priority']
-    ]
-    if cols['correct']:
-        display_cols.append(cols['correct'])
-    available = [c for c in display_cols if c in df_view.columns]
-    st.dataframe(df_view[available].sort_values('Sa_1s_g', ascending=False), use_container_width=True, height=500)
-
-    if cols['prob_cols']:
-        st.markdown('**Predicted probability breakdown**')
-        sid = st.selectbox('Choose a bridge', df_view['Structure_ID'].astype(str).tolist())
-        row = df_view[df_view['Structure_ID'].astype(str) == sid].iloc[0]
-        prob_df = pd.DataFrame({
-            'Damage State': DS_ORDER,
-            'Probability': [row[p] for p in cols['prob_cols']]
-        })
-        figp = px.bar(prob_df, x='Damage State', y='Probability', color='Damage State', color_discrete_map=COLOR_MAP,
-                      title=f'{model_name} probabilities for bridge {sid}')
-        figp.update_layout(height=400)
-        st.plotly_chart(figp, use_container_width=True)
-
-with tab4:
-    st.markdown('**Repair priority view**')
-    priority_df = df_view[[
-        'Structure_ID', 'HWB_Class', 'Year_Built', 'Design_Era', 'Sa_1s_g',
-        'Observed_DS', cols['ds'], cols['repair_cat'], cols['repair_action'], cols['priority']
-    ]].copy()
-    priority_df = priority_df.sort_values(cols['priority'], ascending=False)
-    st.dataframe(priority_df, use_container_width=True, height=500)
-
-    figpr = px.histogram(priority_df, x=cols['priority'], color=cols['repair_cat'], barmode='group',
-                         title=f'{model_name} Repair Priority Distribution')
-    figpr.update_layout(height=400)
-    st.plotly_chart(figpr, use_container_width=True)
-
-with tab5:
-    d1, d2 = st.columns(2)
-    with d1:
-        figf = px.bar(feat.sort_values('Importance', ascending=True), x='Importance', y='Feature', orientation='h',
-                      title='Random Forest Feature Importance')
-        figf.update_layout(height=420)
-        st.plotly_chart(figf, use_container_width=True)
-
-    with d2:
-        if cols['correct']:
-            cmp = pd.DataFrame({
-                'Type': ['Correct', 'Incorrect'],
-                'Count': [int(df_view[cols['correct']].sum()), int((1 - df_view[cols['correct']]).sum())]
-            })
-            figc = px.pie(cmp, names='Type', values='Count', title=f'{model_name} Correct vs Incorrect')
-            figc.update_layout(height=420)
-            st.plotly_chart(figc, use_container_width=True)
-        else:
-            st.info('Observed view does not include model diagnostics.')
-
-    st.markdown('**Model KPI summary from exported file**')
-    st.dataframe(summary, use_container_width=True)
-
-st.markdown('---')
-st.caption(
-    'Expected usage: first run your ML notebook/export script to generate ml_bridges.csv, ml_summary.csv, '
-    'ml_feature_importance.csv, ml_long.csv, and ml_repair_priority.csv; then point this Streamlit app to that folder.'
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.title("Dashboard Controls")
+page = st.sidebar.radio(
+    "Go to",
+    ["Overview", "Damage Comparison", "Map View", "Bridge Explorer", "Repair Priority", "Model Insights"],
 )
+
+selected_hwb = st.sidebar.multiselect(
+    "Filter HWB Class",
+    sorted(df["HWB_Class"].dropna().unique().tolist())
+)
+selected_era = st.sidebar.multiselect(
+    "Filter Design Era",
+    sorted(df["Design_Era"].dropna().unique().tolist())
+)
+sa_min = float(df["Sa_1s_g"].min())
+sa_max = float(df["Sa_1s_g"].max())
+sa_range = st.sidebar.slider(
+    "Sa(1.0s) Range",
+    min_value=sa_min,
+    max_value=sa_max,
+    value=(sa_min, sa_max),
+)
+
+filtered = df.copy()
+filtered = filtered[(filtered["Sa_1s_g"] >= sa_range[0]) & (filtered["Sa_1s_g"] <= sa_range[1])]
+if selected_hwb:
+    filtered = filtered[filtered["HWB_Class"].isin(selected_hwb)]
+if selected_era:
+    filtered = filtered[filtered["Design_Era"].isin(selected_era)]
+
+# ============================================================
+# HEADER
+# ============================================================
+st.title("Bridge Damage Dashboard")
+st.caption("Observed vs Random Forest vs Gaussian Mixture Model")
+
+# ============================================================
+# PAGES
+# ============================================================
+if page == "Overview":
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Bridges", len(filtered))
+    c2.metric("Observed Damaged", int((filtered["Observed_DS"] != "none").sum()))
+
+    if "RF_DS" in filtered.columns:
+        rf_m = metrics_from_prediction(filtered, "RF_DS")
+        c3.metric("RF Overall Accuracy", f'{rf_m["overall_accuracy"]:.1f}%')
+        c4.metric("RF Damaged Accuracy", f'{rf_m["damaged_accuracy"]:.1f}%')
+
+    c5, c6, c7, c8 = st.columns(4)
+    if "GMM_MAP_DS" in filtered.columns:
+        gmm_m = metrics_from_prediction(filtered, "GMM_MAP_DS")
+        c5.metric("GMM MAP Overall", f'{gmm_m["overall_accuracy"]:.1f}%')
+        c6.metric("GMM MAP Damaged", f'{gmm_m["damaged_accuracy"]:.1f}%')
+    if "GMM_COST_DS" in filtered.columns:
+        gmmc_m = metrics_from_prediction(filtered, "GMM_COST_DS")
+        c7.metric("GMM Cost Overall", f'{gmmc_m["overall_accuracy"]:.1f}%')
+        c8.metric("GMM Cost Damaged", f'{gmmc_m["damaged_accuracy"]:.1f}%')
+
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(damage_count_chart(filtered), use_container_width=True)
+    with right:
+        st.plotly_chart(repair_count_chart(filtered), use_container_width=True)
+
+elif page == "Damage Comparison":
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(damage_count_chart(filtered), use_container_width=True)
+    with right:
+        st.plotly_chart(repair_count_chart(filtered), use_container_width=True)
+
+    st.plotly_chart(per_ds_correct_chart(filtered), use_container_width=True)
+    st.plotly_chart(missed_false_alarm_chart(filtered), use_container_width=True)
+
+    rows = []
+    if "RF_DS" in filtered.columns:
+        m = metrics_from_prediction(filtered, "RF_DS")
+        rows.append(["Random Forest", m["overall_accuracy"], m["damaged_accuracy"], m["missed_damaged"], m["false_alarms"]])
+    if "GMM_MAP_DS" in filtered.columns:
+        m = metrics_from_prediction(filtered, "GMM_MAP_DS")
+        rows.append(["GMM MAP", m["overall_accuracy"], m["damaged_accuracy"], m["missed_damaged"], m["false_alarms"]])
+    if "GMM_COST_DS" in filtered.columns:
+        m = metrics_from_prediction(filtered, "GMM_COST_DS")
+        rows.append(["GMM Cost", m["overall_accuracy"], m["damaged_accuracy"], m["missed_damaged"], m["false_alarms"]])
+
+    if rows:
+        summary_df = pd.DataFrame(
+            rows,
+            columns=["Model", "Overall Accuracy (%)", "Damaged Accuracy (%)", "Missed Damaged", "False Alarms"]
+        )
+        st.dataframe(summary_df.round(2), use_container_width=True, hide_index=True)
+
+elif page == "Map View":
+    overlay_choices = []
+    if "RF_DS" in filtered.columns:
+        overlay_choices.append("RF")
+    if "GMM_MAP_DS" in filtered.columns:
+        overlay_choices.append("GMM MAP")
+    if "GMM_COST_DS" in filtered.columns:
+        overlay_choices.append("GMM Cost")
+    if len(overlay_choices) >= 2:
+        overlay_choices.append("Both")
+
+    overlay_model = st.selectbox("Overlay model on map", overlay_choices)
+    st.plotly_chart(map_figure(filtered, overlay_model), use_container_width=True)
+    st.info("Solid markers = observed damaged bridges. Open circles = bridges where model prediction is more severe than the observed damage state.")
+
+elif page == "Bridge Explorer":
+    ids = filtered["Structure_ID"].astype(str).tolist()
+    selected_id = st.selectbox("Select Structure ID", ids)
+    row = filtered[filtered["Structure_ID"].astype(str) == str(selected_id)].iloc[0]
+
+    details = {
+        "Structure ID": row["Structure_ID"],
+        "HWB Class": row["HWB_Class"],
+        "Year Built": row["Year_Built"],
+        "Design Era": row["Design_Era"],
+        "Num Spans": row.get("Num_Spans", np.nan),
+        "Sa(1.0s)": row["Sa_1s_g"],
+        "PGA": row.get("PGA_g", np.nan),
+        "Observed DS": row["Observed_DS"],
+        "RF DS": row.get("RF_DS", "NA"),
+        "GMM MAP DS": row.get("GMM_MAP_DS", "NA"),
+        "GMM Cost DS": row.get("GMM_COST_DS", "NA"),
+        "Observed Repair": row["Obs_Repair_Action"],
+        "RF Repair": row.get("RF_Repair_Action", "NA"),
+        "GMM MAP Repair": row.get("GMM_MAP_Repair_Action", "NA"),
+        "GMM Cost Repair": row.get("GMM_COST_Repair_Action", "NA"),
+    }
+    st.dataframe(pd.DataFrame(details.items(), columns=["Field", "Value"]), use_container_width=True, hide_index=True)
+
+elif page == "Repair Priority":
+    options = []
+    if "RF_Priority" in filtered.columns:
+        options.append(("Random Forest", "RF_Priority", "RF_DS", "RF_Repair_Action"))
+    if "GMM_MAP_Priority" in filtered.columns:
+        options.append(("GMM MAP", "GMM_MAP_Priority", "GMM_MAP_DS", "GMM_MAP_Repair_Action"))
+    if "GMM_COST_Priority" in filtered.columns:
+        options.append(("GMM Cost", "GMM_COST_Priority", "GMM_COST_DS", "GMM_COST_Repair_Action"))
+
+    model_names = [x[0] for x in options]
+    selected_model = st.radio("Priority source", model_names, horizontal=True)
+    choice = next(x for x in options if x[0] == selected_model)
+    _, pri_col, ds_col, action_col = choice
+
+    min_priority = st.slider("Minimum priority", 0, 4, 2)
+    top_df = filtered[filtered[pri_col] >= min_priority].sort_values(pri_col, ascending=False)
+
+    show_cols = ["Structure_ID", "HWB_Class", "Year_Built", "Design_Era", "Sa_1s_g", ds_col, action_col, pri_col]
+    st.dataframe(top_df[show_cols], use_container_width=True, hide_index=True)
+
+elif page == "Model Insights":
+    if not feat_df.empty:
+        st.plotly_chart(make_feature_chart(feat_df), use_container_width=True)
+    else:
+        st.warning("Feature importance file not found.")
+
+    st.plotly_chart(per_ds_correct_chart(filtered), use_container_width=True)
+    st.plotly_chart(missed_false_alarm_chart(filtered), use_container_width=True)
+
+st.markdown("---")
+st.caption("Data source: repository CSV files under /data")
