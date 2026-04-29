@@ -350,6 +350,54 @@ st.title("Bridge Damage Dashboard")
 st.caption("Observed vs Random Forest vs GMM")
 
 tab1, tab2, tab3 = st.tabs(["Damage View", "Bridge Explorer", "Model Insights"])
+def repair_count_chart(df: pd.DataFrame) -> go.Figure:
+    cats = ["Safe", "Needs Repair", "Needs Closure", "Needs Replacement"]
+
+    fig = go.Figure()
+
+    obs_map = {
+        "none": "Safe",
+        "slight": "Needs Repair",
+        "moderate": "Needs Repair",
+        "extensive": "Needs Closure",
+        "complete": "Needs Replacement",
+    }
+
+    obs_repair = df["Observed_DS"].map(obs_map)
+
+    fig.add_bar(
+        name="Observed",
+        x=cats,
+        y=[(obs_repair == c).sum() for c in cats],
+        marker_color="#4CAF50",
+    )
+
+    if "RF_DS" in df.columns:
+        rf_repair = df["RF_DS"].map(obs_map)
+        fig.add_bar(
+            name="RF",
+            x=cats,
+            y=[(rf_repair == c).sum() for c in cats],
+            marker_color="#2196F3",
+        )
+
+    if "GMM_DS" in df.columns:
+        gmm_repair = df["GMM_DS"].map(obs_map)
+        fig.add_bar(
+            name="GMM",
+            x=cats,
+            y=[(gmm_repair == c).sum() for c in cats],
+            marker_color="#FF9800",
+        )
+
+    fig.update_layout(
+        barmode="group",
+        title="Repair Category Counts",
+        xaxis_title="Repair Category",
+        yaxis_title="Number of Bridges",
+        height=400,
+    )
+    return fig
 
 with tab1:
     c1, c2, c3, c4 = st.columns(4)
