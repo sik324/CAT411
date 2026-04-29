@@ -262,6 +262,8 @@ def prob_table(row: pd.Series):
         return None
     return pd.DataFrame(rows)
 
+DS_ORDER = ["none", "slight", "moderate", "extensive", "complete"]
+
 def damage_count_chart(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     x = [ds.capitalize() for ds in DS_ORDER]
