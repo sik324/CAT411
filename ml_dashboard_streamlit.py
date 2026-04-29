@@ -50,7 +50,7 @@ def load_data():
     return bridges, feat
 
 
-def normalize_bridges(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     colmap = {
