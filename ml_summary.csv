@@ -1,0 +1,2 @@
+Total_Bridges,Observed_Damaged,RF_Predicted_Damaged,MLP_Predicted_Damaged,RF_Overall_Acc,RF_Damaged_Acc,RF_Missed,RF_False_Alarms,MLP_Overall_Acc,MLP_Damaged_Acc,MLP_Missed,MLP_False_Alarms,Obs_Safe,Obs_Needs_Repair,Obs_Needs_Closure,Obs_Needs_Replacement,RF_Safe,RF_Needs_Repair,RF_Needs_Closure,RF_Needs_Replacement,MLP_Safe,MLP_Needs_Repair,MLP_Needs_Closure,MLP_Needs_Replacement
+2008,154,239,187,93.6,81.8,16,101,94.8,73.4,31,64,1854,139,10,5,1769,202,20,17,1821,165,13,9
