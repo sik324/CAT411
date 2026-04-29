@@ -262,6 +262,42 @@ def prob_table(row: pd.Series):
         return None
     return pd.DataFrame(rows)
 
+def damage_count_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    x = [ds.capitalize() for ds in DS_ORDER]
+
+    fig.add_bar(
+        name="Observed",
+        x=x,
+        y=[(df["Observed_DS"] == ds).sum() for ds in DS_ORDER],
+        marker_color="#4CAF50",
+    )
+
+    if "RF_DS" in df.columns:
+        fig.add_bar(
+            name="RF",
+            x=x,
+            y=[(df["RF_DS"] == ds).sum() for ds in DS_ORDER],
+            marker_color="#2196F3",
+        )
+
+    if "GMM_DS" in df.columns:
+        fig.add_bar(
+            name="GMM",
+            x=x,
+            y=[(df["GMM_DS"] == ds).sum() for ds in DS_ORDER],
+            marker_color="#FF9800",
+        )
+
+    fig.update_layout(
+        barmode="group",
+        title="Damage State Counts",
+        xaxis_title="Damage State",
+        yaxis_title="Number of Bridges",
+        height=400,
+    )
+    return fig
+
 
 # ------------------------------------------------------------
 # LOAD DATA
